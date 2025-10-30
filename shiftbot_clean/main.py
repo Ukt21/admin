@@ -272,7 +272,7 @@ async def reg_full_name(m: Message, state: FSMContext):
     await m.answer("✅ Спасибо! Теперь выбери своё подразделение:", reply_markup=departments_kb(DEPARTMENTS))
 
 
-@rt.callback_query(F.data.startswith("dept:")))
+@rt.callback_query(F.data.startswith("dept:"))
 async def cb_set_dept(cq: CallbackQuery):
     u = await get_user_by_tg(cq.from_user.id)
     if u is None:

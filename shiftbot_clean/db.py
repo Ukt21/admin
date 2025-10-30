@@ -94,3 +94,28 @@ async def month_minutes_for_user(user_id: int, year: int, month: int):
                 dt_out = datetime.fromisoformat(r[1])
                 total += int((dt_out - dt_in).total_seconds() // 60)
         return total
+        async def month_days_for_user(user_id: int, year: int, month: int):
+    """Возвращает список словарей по каждому дню месяца с минутами"""
+    import aiosqlite
+    from datetime import datetime
+
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month+1:02d}-01" if month < 12 else f"{year+1}-01-01"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute('''SELECT work_date, check_in, check_out
+                                  FROM shifts
+                                  WHERE user_id=? AND work_date>=? AND work_date<?''',
+                               (user_id, start, end))
+        result = []
+        for r in await cur.fetchall():
+            if r["check_in"] and r["check_out"]:
+                dt_in = datetime.fromisoformat(r["check_in"])
+                dt_out = datetime.fromisoformat(r["check_out"])
+                mins = int((dt_out - dt_in).total_seconds() // 60)
+                result.append({
+                    "date": r["work_date"],
+                    "minutes": mins
+                })
+        return result
+

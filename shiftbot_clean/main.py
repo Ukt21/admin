@@ -1,547 +1,535 @@
-from __future__ import annotations
+# main.py
+# Boss Control — учёт смен, часов и локации
+# Python 3.10+, aiogram 3.x
 
-import os, io, csv, zipfile, pathlib, asyncio
-from datetime import date, timedelta
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from contextlib import closing
+from typing import Optional, Tuple, List
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
-from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+# ==========================
+# Конфиг
+# ==========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+TZ = timezone(timedelta(hours=+5))  # Ташкент/Узбекистан по умолчанию; поменяй при необходимости
+DB_PATH = os.getenv("DB_PATH", "boss_control.db")
 
-from db import (
-    init_db, get_user_by_tg, create_user, set_user_department,
-    get_or_create_shift, set_check_in, set_check_out,
-    fetch_today_shifts, month_minutes_for_user, month_days_for_user,
-    range_days_for_user, month_minutes_by_user, log_event
-)
-from utils import now_local, today_local_str, haversine_m
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-# ================== ENV ==================
-load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+# ==========================
+# База данных (SQLite)
+# ==========================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-MANAGERS_CHAT_ID = int(os.getenv("MANAGERS_CHAT_ID", "0"))
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent")
-REPORT_HOUR = int(os.getenv("REPORT_HOUR", "23"))
-REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "30"))
-DEPARTMENTS = [d.strip() for d in os.getenv("DEPARTMENTS", "Зал,Кухня,Бар,Хостес,Пицца,Технички").split(",") if d.strip()]
 
-PLACE_LAT = float(os.getenv("PLACE_LAT", "0"))
-PLACE_LON = float(os.getenv("PLACE_LON", "0"))
-RADIUS_METERS = float(os.getenv("RADIUS_METERS", "150"))
+def init_db():
+    with closing(db()) as conn, conn:
+        conn.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                username TEXT,
+                created_at TEXT NOT NULL
+            );
 
-ADMIN_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+            CREATE TABLE IF NOT EXISTS shifts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                start_ts TEXT NOT NULL,
+                end_ts TEXT,
+                start_lat REAL,
+                start_lon REAL,
+                end_lat REAL,
+                end_lon REAL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
 
-# ================== BOT CORE ==================
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-rt = Router()
+            CREATE INDEX IF NOT EXISTS idx_shifts_user ON shifts(user_id);
+            """
+        )
 
-# runtime state
-PENDING_ACTION: dict[int, str] = {}      # {user_id: "in"|"out"}
-AWAIT_FULLNAME: set[int] = set()         # кто сейчас вводит ФИО
-RANGE_PICK: dict[int, dict] = {}         # выбор периода
 
-# ================== KEYBOARDS ==================
-def staff_menu(status: str) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
-    if status == "idle":
-        kb = [[KeyboardButton(text="🟢 Пришёл")]]
-    elif status == "checked_in":
-        kb = [[KeyboardButton(text="🔴 Ушёл")]]
+def get_user(user_id: int) -> Optional[sqlite3.Row]:
+    with closing(db()) as conn, conn:
+        cur = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return cur.fetchone()
+
+
+def upsert_user(user_id: int, full_name: str, username: Optional[str]):
+    with closing(db()) as conn, conn:
+        if get_user(user_id):
+            conn.execute(
+                "UPDATE users SET full_name=?, username=? WHERE user_id=?",
+                (full_name, username, user_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO users(user_id, full_name, username, created_at) VALUES (?,?,?,?)",
+                (user_id, full_name, username, now_iso()),
+            )
+
+
+def open_shift_exists(user_id: int) -> Optional[sqlite3.Row]:
+    with closing(db()) as conn, conn:
+        cur = conn.execute(
+            "SELECT * FROM shifts WHERE user_id=? AND end_ts IS NULL ORDER BY start_ts DESC LIMIT 1",
+            (user_id,),
+        )
+        return cur.fetchone()
+
+
+def start_shift(user_id: int, lat: Optional[float] = None, lon: Optional[float] = None):
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "INSERT INTO shifts(user_id, start_ts, start_lat, start_lon) VALUES (?,?,?,?)",
+            (user_id, now_iso(), lat, lon),
+        )
+
+
+def end_shift(user_id: int, lat: Optional[float] = None, lon: Optional[float] = None) -> Optional[sqlite3.Row]:
+    with closing(db()) as conn, conn:
+        cur = conn.execute(
+            "SELECT * FROM shifts WHERE user_id=? AND end_ts IS NULL ORDER BY start_ts DESC LIMIT 1",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE shifts SET end_ts=?, end_lat=?, end_lon=? WHERE id=?",
+            (now_iso(), lat, lon, row["id"]),
+        )
+        return row
+
+
+def list_shifts_between(user_id: int, since: datetime, until: datetime) -> List[sqlite3.Row]:
+    with closing(db()) as conn, conn:
+        cur = conn.execute(
+            """
+            SELECT * FROM shifts
+            WHERE user_id=?
+              AND start_ts >= ?
+              AND (end_ts <= ? OR end_ts IS NULL)
+            ORDER BY start_ts ASC
+            """,
+            (user_id, since.isoformat(), until.isoformat()),
+        )
+        return cur.fetchall()
+
+
+def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
     else:
-        return ReplyKeyboardRemove()
-    return ReplyKeyboardMarkup(resize_keyboard=True, keyboard=kb,
-                               input_field_placeholder="Отметь статус смены")
+        end = start.replace(month=start.month + 1)
+    return start, end
 
-def request_location_kb() -> ReplyKeyboardMarkup:
+
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+def now_iso() -> str:
+    return datetime.now(TZ).replace(microsecond=0).isoformat()
+
+
+def shift_duration_sec(row: sqlite3.Row) -> int:
+    start = parse_iso(row["start_ts"])
+    end = parse_iso(row["end_ts"]) if row["end_ts"] else datetime.now(TZ)
+    return int((end - start).total_seconds())
+
+
+def human_td(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h} ч {m:02d} мин"
+
+
+# ==========================
+# FSM состояния
+# ==========================
+class Reg(StatesGroup):
+    waiting_fullname = State()
+
+
+class Report(StatesGroup):
+    picking_from = State()
+    picking_to = State()
+
+
+# ==========================
+# Клавиатуры
+# ==========================
+def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🟢 Пришёл"), KeyboardButton(text="🔴 Ушёл")],
+            [KeyboardButton(text="🕒 Мои часы"), KeyboardButton(text="📅 Мои смены")],
+            [KeyboardButton(text="📍 Отправить геопозицию", request_location=True)],
+            [KeyboardButton(text="⚙️ Настройки")],
+        ],
         resize_keyboard=True,
-        one_time_keyboard=True,
-        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
-        input_field_placeholder="Нажми, чтобы отправить геолокацию"
+        input_field_placeholder="Выберите действие…",
     )
 
-def departments_kb(depts: list[str]) -> InlineKeyboardMarkup:
-    rows, row = [], []
-    for i, d in enumerate(depts, start=1):
-        row.append(InlineKeyboardButton(text=d, callback_data=f"dept:{d}"))
-        if i % 3 == 0:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def profile_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🕒 Мои часы",  callback_data="prof:hours"),
-         InlineKeyboardButton(text="📅 Мои смены", callback_data="prof:days")],
-        [InlineKeyboardButton(text="📆 Выбрать период", callback_data="prof:period")]
-    ])
+def settings_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Изменить ФИО", callback_data="settings:rename")
+    kb.button(text="Назад", callback_data="settings:back")
+    return kb.as_markup()
 
-# ================== CALENDAR HELPERS ==================
-def _next_month(y: int, m: int) -> tuple[int, int]:  return (y + (m // 12), 1 if m == 12 else m + 1)
-def _prev_month(y: int, m: int) -> tuple[int, int]:  return (y - 1 if m == 1 else y, 12 if m == 1 else m - 1)
 
-def _month_matrix(y: int, m: int) -> list[list[str]]:
-    first = date(y, m, 1); start_weekday = first.weekday()
-    ny, nm = _next_month(y, m); last = date(ny, nm, 1) - timedelta(days=1)
-    cells = [""] * start_weekday + [f"{d:02d}" for d in range(1, last.day + 1)]
-    while len(cells) % 7 != 0: cells.append("")
-    return [cells[i:i+7] for i in range(0, len(cells), 7)]
+def calendar_kb(year: int, month: int, mode: str) -> InlineKeyboardMarkup:
+    """
+    mode: 'from' либо 'to' — что выбираем сейчас
+    """
+    import calendar as cal
 
-def _badge(d: date, f: date | None, t: date | None) -> str:
-    if f and d == f: return "🟢"
-    if t and d == t: return "🔴"
-    if f and t and f < d < t: return "▫️"
-    return ""
+    cal.setfirstweekday(cal.MONDAY)
+    _, last_day = cal.monthrange(year, month)
 
-def _calendar_kb(y: int, m: int, step: str, f: date | None, t: date | None) -> InlineKeyboardMarkup:
-    title = f"{y}-{m:02d} • {'Дата от' if step == 'from' else 'Дата до'}"
-    rows = [[InlineKeyboardButton(text=title, callback_data="rng:noop")]]
-    py, pm = _prev_month(y, m); ny, nm = _next_month(y, m)
-    rows.append([
-        InlineKeyboardButton(text="«", callback_data=f"rng:nav:{py}-{pm:02d}"),
-        InlineKeyboardButton(text="Сегодня", callback_data="rng:today"),
-        InlineKeyboardButton(text="»", callback_data=f"rng:nav:{ny}-{nm:02d}")
-    ])
-    rows.append([InlineKeyboardButton(text=t, callback_data="rng:noop") for t in ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]])
-    for wk in _month_matrix(y, m):
-        r = []
-        for cell in wk:
-            if not cell: r.append(InlineKeyboardButton(text=" ", callback_data="rng:noop")); continue
-            d = date(y, m, int(cell))
-            r.append(InlineKeyboardButton(text=f"{cell}{_badge(d, f, t)}", callback_data=f"rng:pick:{d.isoformat()}"))
-        rows.append(r)
-    rows.append([InlineKeyboardButton(text="♻️ Сброс", callback_data="rng:reset")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"{year}-{month:02d} · Дата {('от' if mode=='from' else 'до')}", callback_data="noop")
 
-# ================== HELPERS ==================
-def inside(lat: float, lon: float) -> tuple[bool, int]:
-    d = int(haversine_m(lat, lon, PLACE_LAT, PLACE_LON))
-    return (d <= RADIUS_METERS, d)
-
-async def manager_notify(text: str):
-    if MANAGERS_CHAT_ID != 0:
-        await bot.send_message(MANAGERS_CHAT_ID, text, disable_web_page_preview=True)
-
-def is_admin(uid: int) -> bool:  return uid in ADMIN_IDS
-
-async def report_text() -> str:
-    rows = await fetch_today_shifts(today_local_str())
-    if not rows: return "Сегодня отметок нет."
-    by: dict[str, list] = {}
-    for r in rows:
-        by.setdefault(r["department"] or "Без подразделения", []).append(r)
-    parts = [f"📊 Отчёт за {today_local_str()}\n"]
-    for dname, arr in by.items():
-        parts.append(f"<b>{dname}</b>")
-        for r in arr:
-            ci = r["check_in"][11:16] if r["check_in"] else "—"
-            co = r["check_out"][11:16] if r["check_out"] else "⏳"
-            parts.append(f"• {r['full_name']}: {ci} — {co}")
-        parts.append("")
-    return "\n".join(parts).strip()
-
-async def safe_edit_text(msg, text: str, **kwargs):
-    try: await msg.edit_text(text, **kwargs)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e): raise
-
-async def safe_edit_reply_markup(msg, **kwargs):
-    try: await msg.edit_reply_markup(**kwargs)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e): raise
-
-# ================== HANDЛERS ==================
-@rt.message(Command("help"))
-async def cmd_help(m: Message):
-    extra = "\n• /hours_sum YYYY-MM [1|2] [Отдел] — общий отчёт (админ)" if is_admin(m.from_user.id) else ""
-    await m.answer(
-        "👋 <b>ShiftBot — помощь</b>\n"
-        "• /start — регистрация, выбор подразделения\n"
-        "• /menu — показать кнопки\n"
-        "• /myhours [YYYY-MM] — мои часы за месяц\n"
-        "• /mydays [YYYY-MM] — мои дни и часы за месяц\n"
-        "• /myperiod — часы за произвольный период (календарь)\n"
-        "• /report — отчёт за сегодня" + extra
+    # Навигация по месяцам
+    kb.row(
+        InlineKeyboardButton(text="«", callback_data=f"cal:{mode}:nav:{year}:{month}:prev"),
+        InlineKeyboardButton(text="Сегодня", callback_data=f"cal:{mode}:today"),
+        InlineKeyboardButton(text="»", callback_data=f"cal:{mode}:nav:{year}:{month}:next"),
     )
 
-@rt.message(Command("start"))
-async def cmd_start(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None:
-        await m.answer("👋 Добро пожаловать!\nВведите ваше <b>ФИО полностью</b> (например: Иванов Иван Иванович):")
-        AWAIT_FULLNAME.add(m.from_user.id)
-        return
-    if not u["department"]:
-        return await m.answer("🧩 Выбери своё подразделение:", reply_markup=departments_kb(DEPARTMENTS))
+    # Шапка дней
+    for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]:
+        kb.button(text=d, callback_data="noop")
+    kb.adjust(7)
 
-    # статус на сегодня
-    status = "idle"
-    today_rows = await fetch_today_shifts(today_local_str())
-    for r in today_rows:
-        if r["user_id"] == u["id"]:
-            if r["check_in"] and not r["check_out"]:
-                status = "checked_in"
-            elif r["check_out"]:
-                status = "checked_out"
-            break
-    await m.answer("✅ Готово. Используй меню ниже.", reply_markup=staff_menu(status))
-    await m.answer("👤 Личный кабинет", reply_markup=profile_kb())
+    # Пустые ячейки до 1-го
+    first_weekday = cal.monthrange(year, month)[0]  # 0=Пн
+    for _ in range(first_weekday):
+        kb.button(text=" ", callback_data="noop")
 
-@rt.message(F.text.func(lambda t: isinstance(t, str) and len(t.strip()) >= 3))
-async def reg_full_name(m: Message):
-    if m.from_user.id not in AWAIT_FULLNAME:
+    # Дни месяца
+    for day in range(1, last_day + 1):
+        kb.button(text=f"{day:02d}", callback_data=f"cal:{mode}:pick:{year}:{month}:{day}")
+    kb.adjust(7)
+
+    # Сброс
+    kb.row(InlineKeyboardButton(text="♻️ Сброс", callback_data="cal:reset"))
+    return kb.as_markup()
+
+
+# ==========================
+# /start
+# ==========================
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    init_db()
+
+    u = get_user(message.from_user.id)
+    if not u:
+        await state.set_state(Reg.waiting_fullname)
+        await message.answer(
+            "Привет! Я бот учёта смен «Boss Control».\n\n"
+            "Для начала напиши своё **ФИО** (как в табеле).",
+        )
         return
-    full_name = (m.text or "").strip()
+
+    # Сводка месяца + меню
+    now = datetime.now(TZ)
+    start, end = month_bounds(now)
+    total_sec = 0
+    for row in list_shifts_between(message.from_user.id, start, end):
+        total_sec += shift_duration_sec(row)
+
+    await message.answer(
+        f"🕒 Твои часы за {now.strftime('%Y-%m')}: **{human_td(total_sec)}**\n"
+        f"Выбери *дату ОТ*, затем *дату ДО* в «Мои часы/Мои смены».",
+        reply_markup=main_kb(),
+    )
+
+
+@dp.message(Reg.waiting_fullname)
+async def reg_fullname(message: Message, state: FSMContext):
+    full_name = message.text.strip()
     if len(full_name.split()) < 2:
-        return await m.answer("❗ Введите ФИО полностью (например: Иванов Иван Иванович).")
-    await create_user(m.from_user.id, full_name)
-    AWAIT_FULLNAME.discard(m.from_user.id)
-    await m.answer("✅ Спасибо! Теперь выбери своё подразделение:", reply_markup=departments_kb(DEPARTMENTS))
-
-@rt.callback_query(F.data.startswith("dept:"))
-async def cb_set_dept(cq: CallbackQuery):
-    u = await get_user_by_tg(cq.from_user.id)
-    if u is None:
-        u = await create_user(cq.from_user.id, cq.from_user.full_name or "Без имени")
-    dept = cq.data.split(":", 1)[1]
-    await set_user_department(u["id"], dept)
-    await safe_edit_text(cq.message, f"✅ Подразделение: <b>{dept}</b>")
-    await cq.message.answer("Готово. Используй меню ниже.", reply_markup=staff_menu("idle"))
-    await cq.message.answer("👤 Личный кабинет", reply_markup=profile_kb())
-
-@rt.message(Command("menu"))
-async def cmd_menu(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None or not u["department"]:
-        return await m.answer("Сначала /start.")
-    status = "idle"
-    rows = await fetch_today_shifts(today_local_str())
-    for r in rows:
-        if r["user_id"] == u["id"]:
-            if r["check_in"] and not r["check_out"]:
-                status = "checked_in"
-            elif r["check_out"]:
-                status = "checked_out"
-            break
-    await m.answer("📋 Меню", reply_markup=staff_menu(status))
-    await m.answer("👤 Личный кабинет", reply_markup=profile_kb())
-
-@rt.message(F.text.startswith("🟢 Пришёл"))
-async def ask_loc_in(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None or not u["department"]:
-        return await m.answer("Сначала /start.")
-    PENDING_ACTION[m.from_user.id] = "in"
-    await m.answer("📍 Отправь геолокацию — подтвердим приход.", reply_markup=request_location_kb())
-
-@rt.message(F.text.startswith("🔴 Ушёл"))
-async def ask_loc_out(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None or not u["department"]:
-        return await m.answer("Сначала /start.")
-    PENDING_ACTION[m.from_user.id] = "out"
-    await m.answer("📍 Отправь геолокацию — подтвердим уход.", reply_markup=request_location_kb())
-
-@rt.message(F.location)
-async def on_location(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None or not u["department"]:
-        return await m.answer("Сначала /start.")
-    act = PENDING_ACTION.get(m.from_user.id)
-    if act not in ("in", "out"):
-        return await m.answer("Сначала нажми кнопку в /menu.")
-
-    ok, dist = inside(m.location.latitude, m.location.longitude)
-    if not ok:
-        await m.answer(f"❌ Вне геозоны (~{dist} м). Обратись к менеджеру.", reply_markup=staff_menu("idle"))
-        await manager_notify(f"⚠️ {u['full_name']} ({u['department']}) попытка {('прихода' if act=='in' else 'ухода')} вне зоны (~{dist} м).")
+        await message.answer("Пожалуйста, укажи ФИО полностью (минимум имя и фамилия).")
         return
 
-    wd = today_local_str()
-    await get_or_create_shift(u["id"], wd)
-    ts = now_local().isoformat()
+    upsert_user(message.from_user.id, full_name, message.from_user.username)
+    await state.clear()
+    await message.answer(f"Готово! Запомнил тебя как: **{full_name}** ✅", reply_markup=main_kb())
 
-    if act == "in":
-        ok, _ = await set_check_in(u["id"], wd, ts)
-        if not ok:
-            return await m.answer("ℹ️ Приход уже отмечен сегодня.", reply_markup=staff_menu("checked_in"))
-        await log_event(u["id"], wd, "check_in", ts, m.location.latitude, m.location.longitude)
-        await m.answer("✅ Приход отмечен. Удачной смены!", reply_markup=staff_menu("checked_in"))
-        await manager_notify(f"🟢 {u['full_name']} ({u['department']}) пришёл в {now_local().strftime('%H:%M')} (в радиусе, {dist} м).")
-    else:
-        ok, msg = await set_check_out(u["id"], wd, ts)
-        if not ok:
-            return await m.answer(msg, reply_markup=staff_menu("checked_in"))
-        await log_event(u["id"], wd, "check_out", ts, m.location.latitude, m.location.longitude)
-        await m.answer("✅ Уход отмечен. Хорошего отдыха!", reply_markup=staff_menu("checked_out"))
-        await manager_notify(f"🔴 {u['full_name']} ({u['department']}) ушёл в {now_local().strftime('%H:%M')} (в радиусе, {dist} м).")
 
-    PENDING_ACTION.pop(m.from_user.id, None)
+# ==========================
+# Локация
+# ==========================
+@dp.message(F.location)
+async def got_location(message: Message):
+    # Просто подтверждаем, локация будет прикреплена при приходе/уходе,
+    # если они произойдут в течение «сессии» (тут для простоты — сразу при нажатии).
+    lat = message.location.latitude
+    lon = message.location.longitude
+    await message.answer(f"📍 Локация получена: {lat:.5f}, {lon:.5f}\n"
+                         f"Нажми «🟢 Пришёл» или «🔴 Ушёл», чтобы записать её к отметке.")
 
-@rt.message(Command("report"))
-async def cmd_report(m: Message):
-    await m.answer(await report_text())
 
-# ====== Личный кабинет (инлайн) ======
-@rt.callback_query(F.data == "prof:hours")
-async def cb_prof_hours(cq: CallbackQuery):
-    u = await get_user_by_tg(cq.from_user.id)
-    n = now_local(); y, mon = n.year, n.month
-    mins = await month_minutes_for_user(u["id"], y, mon)
-    await cq.message.answer(f"⏱ Твои часы за {y}-{mon:02d}: <b>{mins//60} ч {mins%60:02d} мин</b>")
+# ==========================
+# Пришёл / Ушёл
+# ==========================
+@dp.message(F.text == "🟢 Пришёл")
+async def arrived(message: Message):
+    init_db()
+    u = get_user(message.from_user.id)
+    if not u:
+        await message.answer("Сначала зарегистрируй ФИО. Напиши его сообщением.")
+        return
 
-@rt.callback_query(F.data == "prof:days")
-async def cb_prof_days(cq: CallbackQuery):
-    u = await get_user_by_tg(cq.from_user.id)
-    n = now_local(); y, mon = n.year, n.month
-    days = await month_days_for_user(u["id"], y, mon)
-    if not days:
-        return await cq.message.answer("Нет закрытых смен за текущий месяц.")
-    lines = [f"📅 Мои дни за {y}-{mon:02d}"]
-    for d in days:
-        lines.append(f"{d['date']}: {d['minutes']//60} ч {d['minutes']%60:02d} мин")
-    await cq.message.answer("\n".join(lines))
+    if open_shift_exists(message.from_user.id):
+        await message.answer("У тебя уже есть открытая смена. Сначала отметь «🔴 Ушёл».")
+        return
 
-@rt.callback_query(F.data == "prof:period")
-async def cb_prof_period(cq: CallbackQuery):
-    t = now_local().date()
-    RANGE_PICK[cq.from_user.id] = {"step": "from", "from": None, "to": None, "year": t.year, "month": t.month}
-    await cq.message.answer("📆 Выбери <b>дату ОТ</b> (затем — дату ДО).",
-                            reply_markup=_calendar_kb(t.year, t.month, "from", None, None))
+    lat, lon = None, None
+    if message.location:
+        lat, lon = message.location.latitude, message.location.longitude
 
-# ====== Календарь периода ======
-@rt.callback_query(F.data.startswith("rng:"))
-async def cb_range(cq: CallbackQuery):
-    uid = cq.from_user.id
-    st = RANGE_PICK.get(uid)
-    if not st:
-        t = now_local().date()
-        st = RANGE_PICK.setdefault(uid, {"step": "from", "from": None, "to": None, "year": t.year, "month": t.month})
+    start_shift(message.from_user.id, lat, lon)
+    await message.answer(f"✅ Отмечено: пришёл в {datetime.now(TZ).strftime('%H:%M')}")
 
-    action, *rest = cq.data.split(":")[1:]
 
-    if action == "noop":
-        return await cq.answer()
+@dp.message(F.text == "🔴 Ушёл")
+async def left(message: Message):
+    init_db()
+    u = get_user(message.from_user.id)
+    if not u:
+        await message.answer("Сначала зарегистрируй ФИО. Напиши его сообщением.")
+        return
 
-    if action == "reset":
-        t = now_local().date()
-        st.update({"step": "from", "from": None, "to": None, "year": t.year, "month": t.month})
-        return await safe_edit_reply_markup(cq.message,
-            reply_markup=_calendar_kb(st["year"], st["month"], st["step"], st["from"], st["to"]))
+    lat, lon = None, None
+    if message.location:
+        lat, lon = message.location.latitude, message.location.longitude
 
-    if action == "today":
-        t = now_local().date()
-        st["year"], st["month"] = t.year, t.month
-        return await safe_edit_reply_markup(cq.message,
-            reply_markup=_calendar_kb(st["year"], st["month"], st["step"], st["from"], st["to"]))
+    row = end_shift(message.from_user.id, lat, lon)
+    if not row:
+        await message.answer("Открытой смены нет. Сначала нажми «🟢 Пришёл».")
+        return
+
+    dur = human_td(shift_duration_sec(row))
+    await message.answer(f"👋 Отмечено: ушёл в {datetime.now(TZ).strftime('%H:%M')}\n"
+                         f"⌛ Длительность смены: {dur}")
+
+
+# ==========================
+# Отчёты (диапазон дат)
+# ==========================
+def send_calendar_for_from() -> InlineKeyboardMarkup:
+    dt = datetime.now(TZ)
+    return calendar_kb(dt.year, dt.month, mode="from")
+
+
+def send_calendar_for_to() -> InlineKeyboardMarkup:
+    dt = datetime.now(TZ)
+    return calendar_kb(dt.year, dt.month, mode="to")
+
+
+@dp.message(F.text == "🕒 Мои часы")
+async def my_hours(message: Message, state: FSMContext):
+    await state.set_state(Report.picking_from)
+    await state.update_data(report_kind="hours")
+    await message.answer("Выбери **дату ОТ** (затем — дату ДО).", reply_markup=send_calendar_for_from())
+
+
+@dp.message(F.text == "📅 Мои смены")
+async def my_shifts(message: Message, state: FSMContext):
+    await state.set_state(Report.picking_from)
+    await state.update_data(report_kind="shifts")
+    await message.answer("Выбери **дату ОТ** (затем — дату ДО).", reply_markup=send_calendar_for_from())
+
+
+@dp.callback_query(F.data.startswith("cal:reset"))
+async def cal_reset(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("Сбросил выбор диапазона. Нажми «🕒 Мои часы» или «📅 Мои смены».")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("cal:from:today"))
+async def cal_from_today(cb: CallbackQuery, state: FSMContext):
+    dt = datetime.now(TZ).date()
+    await state.update_data(date_from=str(dt))
+    await state.set_state(Report.picking_to)
+    await cb.message.edit_text(f"Дата ОТ: **{dt}**\nТеперь выбери **дату ДО**.", reply_markup=send_calendar_for_to())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("cal:to:today"))
+async def cal_to_today(cb: CallbackQuery, state: FSMContext):
+    dt = datetime.now(TZ).date()
+    data = await state.get_data()
+    if "date_from" not in data:
+        await cb.answer("Сначала выбери дату ОТ.", show_alert=True)
+        return
+    await state.update_data(date_to=str(dt))
+    await finish_report(cb, state)
+
+
+@dp.callback_query(F.data.startswith("cal:") & ~F.data.endswith("today") & ~F.data.endswith("reset"))
+async def cal_common(cb: CallbackQuery, state: FSMContext):
+    # cal:{mode}:{action}:{y}:{m}:{d or nav}
+    parts = cb.data.split(":")
+    _, mode, action, y, m, tail = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
 
     if action == "nav":
-        y, m = map(int, rest[0].split("-"))
-        st["year"], st["month"] = y, m
-        return await safe_edit_reply_markup(cq.message,
-            reply_markup=_calendar_kb(st["year"], st["month"], st["step"], st["from"], st["to"]))
+        year = int(y)
+        month = int(m)
+        direction = tail  # prev/next
+        if direction == "prev":
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+        else:
+            month += 1
+            if month == 13:
+                month = 1
+                year += 1
+        kb = calendar_kb(year, month, mode)
+        await cb.message.edit_reply_markup(kb)
+        await cb.answer()
+        return
 
     if action == "pick":
-        y, mo, d = map(int, rest[0].split("-"))
-        picked = date(y, mo, d)
-        if st["step"] == "from":
-            st["from"], st["to"], st["step"] = picked, None, "to"
-            await safe_edit_text(cq.message, "📆 Теперь выбери <b>дату ДО</b>.")
-            return await safe_edit_reply_markup(cq.message,
-                reply_markup=_calendar_kb(st["year"], st["month"], st["step"], st["from"], st["to"]))
-
-        st["to"] = picked
-        if st["from"] and st["to"] and st["to"] < st["from"]:
-            st["from"], st["to"] = st["to"], st["from"]
-
-        df, dt = st["from"], st["to"]
-        if not (df and dt): return await cq.answer("Сначала выбери обе даты.")
-        u = await get_user_by_tg(uid)
-        days = await range_days_for_user(u["id"], df.isoformat(), dt.isoformat())
-        total = sum(x["minutes"] for x in days)
-
-        if not days:
-            txt = f"⏱ Период: {df.isoformat()} — {dt.isoformat()}\nДанных нет (нет закрытых смен)."
+        year, month, day = int(y), int(m), int(tail)
+        picked = datetime(year, month, day, tzinfo=TZ).date()
+        if mode == "from":
+            await state.update_data(date_from=str(picked))
+            await state.set_state(Report.picking_to)
+            await cb.message.edit_text(
+                f"Дата ОТ: **{picked}**\nТеперь выбери **дату ДО**.",
+                reply_markup=send_calendar_for_to(),
+            )
         else:
-            lines = [
-                f"⏱ Период: <b>{df.isoformat()}</b> — <b>{dt.isoformat()}</b>",
-                f"Итого: <b>{total//60} ч {total%60:02d} мин</b>", ""
-            ] + [f"{x['date']}: {x['minutes']//60} ч {x['minutes']%60:02d} мин" for x in days]
-            txt = "\n".join(lines)
+            data = await state.get_data()
+            if "date_from" not in data:
+                await cb.answer("Сначала выбери дату ОТ.", show_alert=True)
+                return
+            await state.update_data(date_to=str(picked))
+            await finish_report(cb, state)
+        await cb.answer()
+        return
 
-        st.update({"step": "from", "from": None, "to": None})
-        await safe_edit_text(cq.message, txt)
-        return await safe_edit_reply_markup(cq.message,
-            reply_markup=_calendar_kb(st["year"], st["month"], st["step"], st["from"], st["to"]))
 
-# ====== Пользовательские команды ======
-@rt.message(Command("myhours"))
-async def cmd_myhours(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None: return await m.answer("Сначала /start.")
-    args = m.text.split(maxsplit=1)
-    if len(args) == 2:
-        try: y, mon = map(int, args[1].split("-"))
-        except: return await m.answer("Формат: /myhours 2025-10")
+async def finish_report(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    date_from = datetime.fromisoformat(data["date_from"]).replace(tzinfo=TZ)
+    date_to = datetime.fromisoformat(data["date_to"]).replace(tzinfo=TZ)
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    # включительно по дату ДО (до конца дня)
+    date_to_end = date_to + timedelta(days=1)
+
+    rows = list_shifts_between(cb.from_user.id, date_from, date_to_end)
+    kind = data.get("report_kind", "hours")
+
+    if kind == "hours":
+        total = sum(shift_duration_sec(r) for r in rows)
+        text = (
+            f"🕒 Часы c **{date_from.date()}** по **{date_to.date()}**:\n"
+            f"Итого: **{human_td(total)}**\n\n"
+            f"Совет: можно выбрать и весь месяц — результат посчитается автоматически."
+        )
     else:
-        n = now_local(); y, mon = n.year, n.month
-    mins = await month_minutes_for_user(u["id"], y, mon)
-    await m.answer(f"⏱ Твои часы за {y}-{mon:02d}: <b>{mins//60} ч {mins%60:02d} мин</b>")
+        if not rows:
+            text = f"📅 Смены с **{date_from.date()}** по **{date_to.date()}**: ничего не найдено."
+        else:
+            lines = []
+            for r in rows:
+                start = parse_iso(r["start_ts"]).strftime("%Y-%m-%d %H:%M")
+                end = parse_iso(r["end_ts"]).strftime("%Y-%m-%d %H:%M") if r["end_ts"] else "—"
+                dur = human_td(shift_duration_sec(r))
+                lines.append(f"• {start} → {end}  ({dur})")
+            text = f"📅 Смены с **{date_from.date()}** по **{date_to.date()}**:\n" + "\n".join(lines)
 
-@rt.message(Command("mydays"))
-async def cmd_mydays(m: Message):
-    await init_db()
-    u = await get_user_by_tg(m.from_user.id)
-    if u is None: return await m.answer("Сначала /start.")
-    args = m.text.split(maxsplit=1)
-    if len(args) == 2:
-        try: y, mon = map(int, args[1].split("-"))
-        except: return await m.answer("Формат: /mydays 2025-10")
-    else:
-        n = now_local(); y, mon = n.year, n.month
-    days = await month_days_for_user(u["id"], y, mon)
-    if not days: return await m.answer("Нет закрытых смен за период.")
-    lines = [f"📅 Мои дни за {y}-{mon:02d}"] + [f"{d['date']}: {d['minutes']//60} ч {d['minutes']%60:02d} мин" for d in days]
-    await m.answer("\n".join(lines))
+    await state.clear()
+    await cb.message.edit_text(text)
 
-# ====== АДМИН ======
-@rt.message(Command("hours_sum"))
-async def cmd_hours_sum(m: Message):
-    if m.from_user.id not in ADMIN_IDS:
-        return await m.answer("Команда доступна только администраторам.")
-    args = m.text.split()
-    if len(args) < 2:
-        return await m.answer("Формат: /hours_sum YYYY-MM [1|2] [Отдел]\nПример: /hours_sum 2025-10 1 Кухня")
-    try:
-        year, month = map(int, args[1].split("-"))
-    except:
-        return await m.answer("Ошибка формата даты. Пример: 2025-10")
 
-    part = None; dept = None
-    if len(args) >= 3 and args[2] in ("1", "2"): part = int(args[2])
-    if len(args) >= 4: dept = " ".join(args[3:])
+# ==========================
+# Настройки
+# ==========================
+@dp.message(F.text == "⚙️ Настройки")
+async def settings(message: Message):
+    await message.answer("Настройки:", reply_markup=settings_kb())
 
-    if part == 1: start_day, end_day = 1, 15
-    elif part == 2: start_day, end_day = 16, None
-    else: start_day, end_day = 1, None
 
-    items = await month_minutes_by_user(year, month, start_day=start_day, end_day=end_day, department=dept)
-    if not items: return await m.answer("Нет данных за указанный период.")
+@dp.callback_query(F.data == "settings:rename")
+async def settings_rename(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Reg.waiting_fullname)
+    await cb.message.answer("Отправь новое **ФИО** сообщением.")
+    await cb.answer()
 
-    by = {}; total_all = 0
-    for r in items:
-        d = r["department"] or "Без подразделения"
-        by.setdefault(d, []).append(r)
-        total_all += r["minutes"]
 
-    lines = [f"📊 Сумма часов {year}-{month:02d} " + (f"(часть {part}) " if part else "") + (f"dept: {dept}" if dept else ""), ""]
-    for d, arr in by.items():
-        dept_total = sum(x["minutes"] for x in arr)
-        lines.append(f"— <b>{d}</b>: {dept_total//60} ч {dept_total%60:02d} мин")
-        for x in arr:
-            lines.append(f"   • {x['full_name']}: {x['minutes']//60} ч {x['minutes']%60:02d} мин")
-        lines.append("")
-    lines.append(f"ИТОГО: <b>{total_all//60} ч {total_all%60:02d} мин</b>")
-    await m.answer("\n".join(lines))
+@dp.callback_query(F.data == "settings:back")
+async def settings_back(cb: CallbackQuery):
+    await cb.message.edit_text("Готово. Выбери действие на клавиатуре ниже.", reply_markup=None)
+    await cb.answer()
 
-# ====== Бэкапы ======
-async def export_month_csv_all(y:int, mon:int) -> io.BytesIO:
-    buf = io.StringIO(); w = csv.writer(buf)
-    w.writerow(["user_id","full_name","department","date","minutes","hours_hh:mm"])
-    rows = await month_minutes_by_user(y, mon)
-    for r in rows:
-        hh, mm = r["minutes"]//60, r["minutes"]%60
-        w.writerow([r["user_id"], r["full_name"], r["department"], f"{y}-{mon:02d}", r["minutes"], f"{hh:02d}:{mm:02d}"])
-    data = io.BytesIO(buf.getvalue().encode("utf-8")); data.seek(0); return data
 
-@rt.message(Command("backup_db"))
-async def cmd_backup_db(m: Message):
-    db_path = os.getenv("DB_PATH", "./bot.db")
-    zbuf = io.BytesIO()
-    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(db_path, arcname=pathlib.Path(db_path).name)
-    zbuf.seek(0)
-    await bot.send_document(MANAGERS_CHAT_ID or m.chat.id, ("bot_db.zip", zbuf))
-    await m.answer("Бэкап БД отправлен.")
+# ==========================
+# Команды /help /id
+# ==========================
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "Команды:\n"
+        "/start — главное меню\n"
+        "/help — помощь\n"
+        "/id — твой ID\n\n"
+        "Кнопки:\n"
+        "🟢 Пришёл / 🔴 Ушёл — отметка смены\n"
+        "🕒 Мои часы — сумма часов за период\n"
+        "📅 Мои смены — список смен\n"
+        "📍 Отправить геопозицию — прикрепить локацию к отметке"
+    )
 
-@rt.message(Command("backup_csv"))
-async def cmd_backup_csv(m: Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) != 2: return await m.answer("Формат: /backup_csv YYYY-MM")
-    try: y, mon = map(int, args[1].split("-"))
-    except: return await m.answer("Неверная дата. Пример: /backup_csv 2025-10")
-    data = await export_month_csv_all(y, mon)
-    await bot.send_document(MANAGERS_CHAT_ID or m.chat.id, ("hours.csv", data))
-    await m.answer("CSV отправлен.")
 
-@rt.message(Command("db_check"))
-async def cmd_db_check(m: Message):
-    import aiosqlite
-    db_path = os.getenv("DB_PATH", "./bot.db")
-    try:
-        async with aiosqlite.connect(db_path) as db:
-            cur = await db.execute("PRAGMA quick_check;"); row = await cur.fetchone()
-        await m.answer(f"PRAGMA quick_check: {row[0]}")
-    except Exception as e:
-        await m.answer(f"Ошибка проверки: {e}")
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode=None)
 
-# ================== SCHEDULER ==================
-async def scheduler_setup(sched: AsyncIOScheduler):
-    async def _send_report():
-        try: await bot.send_message(MANAGERS_CHAT_ID, await report_text())
-        except Exception: pass
 
-    async def _night_backup():
-        try:
-            d = now_local().date()
-            data = await export_month_csv_all(d.year, d.month)
-            await bot.send_document(MANAGERS_CHAT_ID, ("hours.csv", data))
-            db_path = os.getenv("DB_PATH", "./bot.db")
-            zbuf = io.BytesIO()
-            with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.write(db_path, arcname=pathlib.Path(db_path).name)
-            zbuf.seek(0)
-            await bot.send_document(MANAGERS_CHAT_ID, ("bot_db.zip", zbuf))
-            await bot.send_message(MANAGERS_CHAT_ID, "Ночной бэкап ✓")
-        except Exception: pass
+# ==========================
+# Запуск
+# ==========================
+async def on_startup():
+    init_db()
+    print("Boss Control bot started.")
 
-    sched.add_job(lambda: asyncio.create_task(_send_report()),
-                  CronTrigger(hour=REPORT_HOUR, minute=REPORT_MINUTE, timezone=TIMEZONE),
-                  id="daily_report", replace_existing=True)
 
-    sched.add_job(lambda: asyncio.create_task(_night_backup()),
-                  CronTrigger(hour=23, minute=59, timezone=TIMEZONE),
-                  id="night_backup", replace_existing=True)
+def main():
+    import asyncio
+    asyncio.run(dp.start_polling(bot, on_startup=on_startup()))
 
-# ================== ENTRYPOINT ==================
-async def main():
-    await init_db()
-    dp.include_router(rt)
-    sched = AsyncIOScheduler()
-    await scheduler_setup(sched)
-    sched.start()
-    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

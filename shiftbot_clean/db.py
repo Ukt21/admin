@@ -113,3 +113,37 @@ async def month_days_for_user(user_id: int, y: int, m: int):
         if mins > 0:
             out.append({"date": r["work_date"], "minutes": mins})
     return out
+    import aiosqlite
+from dateutil import parser as dtparser
+
+async def range_days_for_user(user_id: int, from_date: str, to_date: str):
+    """
+    Возвращает список смен с минутами между двумя датами включительно.
+    from_date / to_date — строки 'YYYY-MM-DD'
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = """
+            SELECT work_date, check_in, check_out
+            FROM shifts
+            WHERE user_id = ?
+              AND work_date BETWEEN ? AND ?
+            ORDER BY work_date
+        """
+        cur = await db.execute(q, (user_id, from_date, to_date))
+        rows = await cur.fetchall()
+
+    results = []
+    for r in rows:
+        ci, co = r["check_in"], r["check_out"]
+        if not ci or not co:
+            continue
+        try:
+            t1 = dtparser.isoparse(ci)
+            t2 = dtparser.isoparse(co)
+            mins = max(int((t2 - t1).total_seconds() // 60), 0)
+        except Exception:
+            mins = 0
+        results.append({"date": r["work_date"], "minutes": mins})
+    return results
+

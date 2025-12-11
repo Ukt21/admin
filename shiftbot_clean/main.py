@@ -3,16 +3,17 @@
 # Python 3.10+, aiogram 3.x
 
 import os
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton, Location
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
@@ -25,8 +26,61 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 TZ = timezone(timedelta(hours=+5))  # Ташкент/Узбекистан по умолчанию; поменяй при необходимости
 DB_PATH = os.getenv("DB_PATH", "boss_control.db")
 
+# Координаты ресторана / офиса (центр зоны)
+OFFICE_LAT = float(os.getenv("OFFICE_LAT", "41.31647163058427"))  # поставь свои
+OFFICE_LON = float(os.getenv("OFFICE_LON", "69.25378645716818"))  # поставь свои
+MAX_DISTANCE_METERS = float(os.getenv("MAX_DISTANCE_METERS", "250"))  # радиус допуска в метрах
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+# Последняя локация пользователя (в оперативной памяти)
+LAST_LOCATION: Dict[int, Tuple[float, float]] = {}
+
+
+# ==========================
+# Утилиты: время + расстояние
+# ==========================
+def now_iso() -> str:
+    return datetime.now(TZ).replace(microsecond=0).isoformat()
+
+
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+def shift_duration_sec(row: sqlite3.Row) -> int:
+    start = parse_iso(row["start_ts"])
+    end = parse_iso(row["end_ts"]) if row["end_ts"] else datetime.now(TZ)
+    return int((end - start).total_seconds())
+
+
+def human_td(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h} ч {m:02d} мин"
+
+
+def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        end = start.replace(year=start.year + 1, month=1)
+    else:
+        end = start.replace(month=start.month + 1)
+    return start, end
+
+
+def distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Расстояние между точками (гаверсинус), метры."""
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
 
 # ==========================
@@ -135,35 +189,6 @@ def list_shifts_between(user_id: int, since: datetime, until: datetime) -> List[
         return cur.fetchall()
 
 
-def month_bounds(dt: datetime) -> Tuple[datetime, datetime]:
-    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if start.month == 12:
-        end = start.replace(year=start.year + 1, month=1)
-    else:
-        end = start.replace(month=start.month + 1)
-    return start, end
-
-
-def parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s)
-
-
-def now_iso() -> str:
-    return datetime.now(TZ).replace(microsecond=0).isoformat()
-
-
-def shift_duration_sec(row: sqlite3.Row) -> int:
-    start = parse_iso(row["start_ts"])
-    end = parse_iso(row["end_ts"]) if row["end_ts"] else datetime.now(TZ)
-    return int((end - start).total_seconds())
-
-
-def human_td(seconds: int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    return f"{h} ч {m:02d} мин"
-
-
 # ==========================
 # FSM состояния
 # ==========================
@@ -243,8 +268,6 @@ def calendar_kb(year: int, month: int, mode: str) -> InlineKeyboardMarkup:
 # ==========================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    init_db()
-
     u = get_user(message.from_user.id)
     if not u:
         await state.set_state(Reg.waiting_fullname)
@@ -263,7 +286,9 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await message.answer(
         f"🕒 Твои часы за {now.strftime('%Y-%m')}: **{human_td(total_sec)}**\n"
-        f"Выбери *дату ОТ*, затем *дату ДО* в «Мои часы/Мои смены».",
+        f"Выбери *дату ОТ*, затем *дату ДО* в «Мои часы/Мои смены».\n\n"
+        f"Для отметки смены сначала отправь геопозицию кнопкой «📍 Отправить геопозицию», "
+        f"затем нажми «🟢 Пришёл» или «🔴 Ушёл».",
         reply_markup=main_kb(),
     )
 
@@ -285,251 +310,21 @@ async def reg_fullname(message: Message, state: FSMContext):
 # ==========================
 @dp.message(F.location)
 async def got_location(message: Message):
-    # Просто подтверждаем, локация будет прикреплена при приходе/уходе,
-    # если они произойдут в течение «сессии» (тут для простоты — сразу при нажатии).
     lat = message.location.latitude
     lon = message.location.longitude
-    await message.answer(f"📍 Локация получена: {lat:.5f}, {lon:.5f}\n"
-                         f"Нажми «🟢 Пришёл» или «🔴 Ушёл», чтобы записать её к отметке.")
+    user_id = message.from_user.id
 
+    LAST_LOCATION[user_id] = (lat, lon)
 
-# ==========================
-# Пришёл / Ушёл
-# ==========================
-@dp.message(F.text == "🟢 Пришёл")
-async def arrived(message: Message):
-    init_db()
-    u = get_user(message.from_user.id)
-    if not u:
-        await message.answer("Сначала зарегистрируй ФИО. Напиши его сообщением.")
-        return
+    dist = distance_m(lat, lon, OFFICE_LAT, OFFICE_LON)
+    inside = dist <= MAX_DISTANCE_METERS
 
-    if open_shift_exists(message.from_user.id):
-        await message.answer("У тебя уже есть открытая смена. Сначала отметь «🔴 Ушёл».")
-        return
-
-    lat, lon = None, None
-    if message.location:
-        lat, lon = message.location.latitude, message.location.longitude
-
-    start_shift(message.from_user.id, lat, lon)
-    await message.answer(f"✅ Отмечено: пришёл в {datetime.now(TZ).strftime('%H:%M')}")
-
-
-@dp.message(F.text == "🔴 Ушёл")
-async def left(message: Message):
-    init_db()
-    u = get_user(message.from_user.id)
-    if not u:
-        await message.answer("Сначала зарегистрируй ФИО. Напиши его сообщением.")
-        return
-
-    lat, lon = None, None
-    if message.location:
-        lat, lon = message.location.latitude, message.location.longitude
-
-    row = end_shift(message.from_user.id, lat, lon)
-    if not row:
-        await message.answer("Открытой смены нет. Сначала нажми «🟢 Пришёл».")
-        return
-
-    dur = human_td(shift_duration_sec(row))
-    await message.answer(f"👋 Отмечено: ушёл в {datetime.now(TZ).strftime('%H:%M')}\n"
-                         f"⌛ Длительность смены: {dur}")
-
-
-# ==========================
-# Отчёты (диапазон дат)
-# ==========================
-def send_calendar_for_from() -> InlineKeyboardMarkup:
-    dt = datetime.now(TZ)
-    return calendar_kb(dt.year, dt.month, mode="from")
-
-
-def send_calendar_for_to() -> InlineKeyboardMarkup:
-    dt = datetime.now(TZ)
-    return calendar_kb(dt.year, dt.month, mode="to")
-
-
-@dp.message(F.text == "🕒 Мои часы")
-async def my_hours(message: Message, state: FSMContext):
-    await state.set_state(Report.picking_from)
-    await state.update_data(report_kind="hours")
-    await message.answer("Выбери **дату ОТ** (затем — дату ДО).", reply_markup=send_calendar_for_from())
-
-
-@dp.message(F.text == "📅 Мои смены")
-async def my_shifts(message: Message, state: FSMContext):
-    await state.set_state(Report.picking_from)
-    await state.update_data(report_kind="shifts")
-    await message.answer("Выбери **дату ОТ** (затем — дату ДО).", reply_markup=send_calendar_for_from())
-
-
-@dp.callback_query(F.data.startswith("cal:reset"))
-async def cal_reset(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("Сбросил выбор диапазона. Нажми «🕒 Мои часы» или «📅 Мои смены».")
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("cal:from:today"))
-async def cal_from_today(cb: CallbackQuery, state: FSMContext):
-    dt = datetime.now(TZ).date()
-    await state.update_data(date_from=str(dt))
-    await state.set_state(Report.picking_to)
-    await cb.message.edit_text(f"Дата ОТ: **{dt}**\nТеперь выбери **дату ДО**.", reply_markup=send_calendar_for_to())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("cal:to:today"))
-async def cal_to_today(cb: CallbackQuery, state: FSMContext):
-    dt = datetime.now(TZ).date()
-    data = await state.get_data()
-    if "date_from" not in data:
-        await cb.answer("Сначала выбери дату ОТ.", show_alert=True)
-        return
-    await state.update_data(date_to=str(dt))
-    await finish_report(cb, state)
-
-
-@dp.callback_query(F.data.startswith("cal:") & ~F.data.endswith("today") & ~F.data.endswith("reset"))
-async def cal_common(cb: CallbackQuery, state: FSMContext):
-    # cal:{mode}:{action}:{y}:{m}:{d or nav}
-    parts = cb.data.split(":")
-    _, mode, action, y, m, tail = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
-
-    if action == "nav":
-        year = int(y)
-        month = int(m)
-        direction = tail  # prev/next
-        if direction == "prev":
-            month -= 1
-            if month == 0:
-                month = 12
-                year -= 1
-        else:
-            month += 1
-            if month == 13:
-                month = 1
-                year += 1
-        kb = calendar_kb(year, month, mode)
-        await cb.message.edit_reply_markup(kb)
-        await cb.answer()
-        return
-
-    if action == "pick":
-        year, month, day = int(y), int(m), int(tail)
-        picked = datetime(year, month, day, tzinfo=TZ).date()
-        if mode == "from":
-            await state.update_data(date_from=str(picked))
-            await state.set_state(Report.picking_to)
-            await cb.message.edit_text(
-                f"Дата ОТ: **{picked}**\nТеперь выбери **дату ДО**.",
-                reply_markup=send_calendar_for_to(),
-            )
-        else:
-            data = await state.get_data()
-            if "date_from" not in data:
-                await cb.answer("Сначала выбери дату ОТ.", show_alert=True)
-                return
-            await state.update_data(date_to=str(picked))
-            await finish_report(cb, state)
-        await cb.answer()
-        return
-
-
-async def finish_report(cb: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    date_from = datetime.fromisoformat(data["date_from"]).replace(tzinfo=TZ)
-    date_to = datetime.fromisoformat(data["date_to"]).replace(tzinfo=TZ)
-    if date_to < date_from:
-        date_from, date_to = date_to, date_from
-
-    # включительно по дату ДО (до конца дня)
-    date_to_end = date_to + timedelta(days=1)
-
-    rows = list_shifts_between(cb.from_user.id, date_from, date_to_end)
-    kind = data.get("report_kind", "hours")
-
-    if kind == "hours":
-        total = sum(shift_duration_sec(r) for r in rows)
-        text = (
-            f"🕒 Часы c **{date_from.date()}** по **{date_to.date()}**:\n"
-            f"Итого: **{human_td(total)}**\n\n"
-            f"Совет: можно выбрать и весь месяц — результат посчитается автоматически."
-        )
-    else:
-        if not rows:
-            text = f"📅 Смены с **{date_from.date()}** по **{date_to.date()}**: ничего не найдено."
-        else:
-            lines = []
-            for r in rows:
-                start = parse_iso(r["start_ts"]).strftime("%Y-%m-%d %H:%M")
-                end = parse_iso(r["end_ts"]).strftime("%Y-%m-%d %H:%M") if r["end_ts"] else "—"
-                dur = human_td(shift_duration_sec(r))
-                lines.append(f"• {start} → {end}  ({dur})")
-            text = f"📅 Смены с **{date_from.date()}** по **{date_to.date()}**:\n" + "\n".join(lines)
-
-    await state.clear()
-    await cb.message.edit_text(text)
-
-
-# ==========================
-# Настройки
-# ==========================
-@dp.message(F.text == "⚙️ Настройки")
-async def settings(message: Message):
-    await message.answer("Настройки:", reply_markup=settings_kb())
-
-
-@dp.callback_query(F.data == "settings:rename")
-async def settings_rename(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Reg.waiting_fullname)
-    await cb.message.answer("Отправь новое **ФИО** сообщением.")
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "settings:back")
-async def settings_back(cb: CallbackQuery):
-    await cb.message.edit_text("Готово. Выбери действие на клавиатуре ниже.", reply_markup=None)
-    await cb.answer()
-
-
-# ==========================
-# Команды /help /id
-# ==========================
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "Команды:\n"
-        "/start — главное меню\n"
-        "/help — помощь\n"
-        "/id — твой ID\n\n"
-        "Кнопки:\n"
-        "🟢 Пришёл / 🔴 Ушёл — отметка смены\n"
-        "🕒 Мои часы — сумма часов за период\n"
-        "📅 Мои смены — список смен\n"
-        "📍 Отправить геопозицию — прикрепить локацию к отметке"
+    text = (
+        f"📍 Локация сохранена: {lat:.5f}, {lon:.5f}\n"
+        f"Расстояние до точки контроля: ~{int(dist)} м "
+        f"(лимит {int(MAX_DISTANCE_METERS)} м).\n\n"
     )
-
-
-@dp.message(Command("id"))
-async def cmd_id(message: Message):
-    await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode=None)
-
-
-# ==========================
-# Запуск
-# ==========================
-async def on_startup():
-    init_db()
-    print("Boss Control bot started.")
-
-
-def main():
-    import asyncio
-    asyncio.run(dp.start_polling(bot, on_startup=on_startup()))
-
-
-if __name__ == "__main__":
-    main()
+    if inside:
+        text += "Ты в допустимой зоне ✅\nТеперь нажми «🟢 Пришёл» или «🔴 Ушёл», чтобы зафиксировать смену."
+    else:
+        text += "Внимание: ты **вне допустимой зоны** ⛔\nЕсли это ошибка — уточни координаты точки контроля у менеджера."

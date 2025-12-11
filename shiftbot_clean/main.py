@@ -27,8 +27,8 @@ TZ = timezone(timedelta(hours=+5))  # Ташкент/Узбекистан по �
 DB_PATH = os.getenv("DB_PATH", "boss_control.db")
 
 # Координаты ресторана / офиса (центр зоны)
-OFFICE_LAT = float(os.getenv("OFFICE_LAT", "41.31647163058427"))  # поставь свои
-OFFICE_LON = float(os.getenv("OFFICE_LON", "69.25378645716818"))  # поставь свои
+OFFICE_LAT = float(os.getenv("OFFICE_LAT", "41.31234"))  # поставь свои
+OFFICE_LON = float(os.getenv("OFFICE_LON", "69.27973"))  # поставь свои
 MAX_DISTANCE_METERS = float(os.getenv("MAX_DISTANCE_METERS", "250"))  # радиус допуска в метрах
 
 bot = Bot(BOT_TOKEN)
@@ -328,3 +328,280 @@ async def got_location(message: Message):
         text += "Ты в допустимой зоне ✅\nТеперь нажми «🟢 Пришёл» или «🔴 Ушёл», чтобы зафиксировать смену."
     else:
         text += "Внимание: ты **вне допустимой зоны** ⛔\nЕсли это ошибка — уточни координаты точки контроля у менеджера."
+
+    await message.answer(text)
+
+
+def get_checked_location_or_error(user_id: int) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Возвращает (lat, lon, error_text).
+    Если ошибки нет — error_text = None.
+    """
+    coords = LAST_LOCATION.get(user_id)
+    if not coords:
+        return None, None, (
+            "Локация не найдена.\n"
+            "Сначала отправь геопозицию кнопкой «📍 Отправить геопозицию», "
+            "а затем снова нажми «🟢 Пришёл» или «🔴 Ушёл»."
+        )
+
+    lat, lon = coords
+    dist = distance_m(lat, lon, OFFICE_LAT, OFFICE_LON)
+    if dist > MAX_DISTANCE_METERS:
+        return lat, lon, (
+            f"Ты слишком далеко от точки контроля (≈{int(dist)} м, лимит {int(MAX_DISTANCE_METERS)} м).\n"
+            f"Смена не отмечена. Убедись, что находишься в ресторане."
+        )
+
+    return lat, lon, None
+
+
+# ==========================
+# Пришёл / Ушёл
+# ==========================
+@dp.message(F.text == "🟢 Пришёл")
+async def arrived(message: Message):
+    u = get_user(message.from_user.id)
+    if not u:
+        await message.answer("Сначала зарегистрируй ФИО. Напиши его сообщением.")
+        return
+
+    if open_shift_exists(message.from_user.id):
+        await message.answer("У тебя уже есть открытая смена. Сначала отметь «🔴 Ушёл».")
+        return
+
+    lat, lon, err = get_checked_location_or_error(message.from_user.id)
+    if err:
+        await message.answer(err)
+        return
+
+    start_shift(message.from_user.id, lat, lon)
+    await message.answer(
+        f"✅ Отмечено: пришёл в {datetime.now(TZ).strftime('%H:%M')}\n"
+        f"Локация привязана к смене."
+    )
+
+
+@dp.message(F.text == "🔴 Ушёл")
+async def left(message: Message):
+    u = get_user(message.from_user.id)
+    if not u:
+        await message.answer("Сначала зарегистрируй ФИО. Напиши его сообщением.")
+        return
+
+    lat, lon, err = get_checked_location_or_error(message.from_user.id)
+    if err:
+        await message.answer(err)
+        return
+
+    row = end_shift(message.from_user.id, lat, lon)
+    if not row:
+        await message.answer("Открытой смены нет. Сначала нажми «🟢 Пришёл».")
+        return
+
+    dur = human_td(shift_duration_sec(row))
+    await message.answer(
+        f"👋 Отмечено: ушёл в {datetime.now(TZ).strftime('%H:%M')}\n"
+        f"⌛ Длительность смены: {dur}\n"
+        f"Локация выхода также сохранена."
+    )
+
+
+# ==========================
+# Отчёты (диапазон дат)
+# ==========================
+def send_calendar_for_from() -> InlineKeyboardMarkup:
+    dt = datetime.now(TZ)
+    return calendar_kb(dt.year, dt.month, mode="from")
+
+
+def send_calendar_for_to() -> InlineKeyboardMarkup:
+    dt = datetime.now(TZ)
+    return calendar_kb(dt.year, dt.month, mode="to")
+
+
+class ReportKind:
+    HOURS = "hours"
+    SHIFTS = "shifts"
+
+
+@dp.message(F.text == "🕒 Мои часы")
+async def my_hours(message: Message, state: FSMContext):
+    await state.set_state(Report.picking_from)
+    await state.update_data(report_kind=ReportKind.HOURS)
+    await message.answer("Выбери **дату ОТ** (затем — дату ДО).", reply_markup=send_calendar_for_from())
+
+
+@dp.message(F.text == "📅 Мои смены")
+async def my_shifts(message: Message, state: FSMContext):
+    await state.set_state(Report.picking_from)
+    await state.update_data(report_kind=ReportKind.SHIFTS)
+    await message.answer("Выбери **дату ОТ** (затем — дату ДО).", reply_markup=send_calendar_for_from())
+
+
+@dp.callback_query(F.data.startswith("cal:reset"))
+async def cal_reset(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("Сбросил выбор диапазона. Нажми «🕒 Мои часы» или «📅 Мои смены».")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("cal:from:today"))
+async def cal_from_today(cb: CallbackQuery, state: FSMContext):
+    dt = datetime.now(TZ).date()
+    await state.update_data(date_from=str(dt))
+    await state.set_state(Report.picking_to)
+    await cb.message.edit_text(f"Дата ОТ: **{dt}**\nТеперь выбери **дату ДО**.", reply_markup=send_calendar_for_to())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("cal:to:today"))
+async def cal_to_today(cb: CallbackQuery, state: FSMContext):
+    dt = datetime.now(TZ).date()
+    data = await state.get_data()
+    if "date_from" not in data:
+        await cb.answer("Сначала выбери дату ОТ.", show_alert=True)
+        return
+    await state.update_data(date_to=str(dt))
+    await finish_report(cb, state)
+
+
+@dp.callback_query(F.data.startswith("cal:") & ~F.data.endswith("today") & ~F.data.endswith("reset"))
+async def cal_common(cb: CallbackQuery, state: FSMContext):
+    # cal:{mode}:{action}:{y}:{m}:{d or nav}
+    parts = cb.data.split(":")
+    _, mode, action, y, m, tail = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+
+    if action == "nav":
+        year = int(y)
+        month = int(m)
+        direction = tail  # prev/next
+        if direction == "prev":
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+        else:
+            month += 1
+            if month == 13:
+                month = 1
+                year += 1
+        kb = calendar_kb(year, month, mode)
+        await cb.message.edit_reply_markup(kb)
+        await cb.answer()
+        return
+
+    if action == "pick":
+        year, month, day = int(y), int(m), int(tail)
+        picked = datetime(year, month, day, tzinfo=TZ).date()
+        if mode == "from":
+            await state.update_data(date_from=str(picked))
+            await state.set_state(Report.picking_to)
+            await cb.message.edit_text(
+                f"Дата ОТ: **{picked}**\nТеперь выбери **дату ДО**.",
+                reply_markup=send_calendar_for_to(),
+            )
+        else:
+            data = await state.get_data()
+            if "date_from" not in data:
+                await cb.answer("Сначала выбери дату ОТ.", show_alert=True)
+                return
+            await state.update_data(date_to=str(picked))
+            await finish_report(cb, state)
+        await cb.answer()
+        return
+
+
+async def finish_report(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    date_from = datetime.fromisoformat(data["date_from"]).replace(tzinfo=TZ)
+    date_to = datetime.fromisoformat(data["date_to"]).replace(tzinfo=TZ)
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    # включительно по дату ДО (до конца дня)
+    date_to_end = date_to + timedelta(days=1)
+
+    rows = list_shifts_between(cb.from_user.id, date_from, date_to_end)
+    kind = data.get("report_kind", ReportKind.HOURS)
+
+    if kind == ReportKind.HOURS:
+        total = sum(shift_duration_sec(r) for r in rows)
+        text = (
+            f"🕒 Часы c **{date_from.date()}** по **{date_to.date()}**:\n"
+            f"Итого: **{human_td(total)}**\n\n"
+            f"Совет: можно выбрать и весь месяц — результат посчитается автоматически."
+        )
+    else:
+        if not rows:
+            text = f"📅 Смены с **{date_from.date()}** по **{date_to.date()}**: ничего не найдено."
+        else:
+            lines = []
+            for r in rows:
+                start = parse_iso(r["start_ts"]).strftime("%Y-%m-%d %H:%M")
+                end = parse_iso(r["end_ts"]).strftime("%Y-%m-%d %H:%M") if r["end_ts"] else "—"
+                dur = human_td(shift_duration_sec(r))
+                lines.append(f"• {start} → {end}  ({dur})")
+            text = f"📅 Смены с **{date_from.date()}** по **{date_to.date()}**:\n" + "\n".join(lines)
+
+    await state.clear()
+    await cb.message.edit_text(text)
+
+
+# ==========================
+# Настройки
+# ==========================
+@dp.message(F.text == "⚙️ Настройки")
+async def settings(message: Message):
+    await message.answer("Настройки:", reply_markup=settings_kb())
+
+
+@dp.callback_query(F.data == "settings:rename")
+async def settings_rename(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Reg.waiting_fullname)
+    await cb.message.answer("Отправь новое **ФИО** сообщением.")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "settings:back")
+async def settings_back(cb: CallbackQuery):
+    await cb.message.edit_text("Готово. Выбери действие на клавиатуре ниже.", reply_markup=None)
+    await cb.answer()
+
+
+# ==========================
+# Команды /help /id
+# ==========================
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "Команды:\n"
+        "/start — главное меню\n"
+        "/help — помощь\n"
+        "/id — твой ID\n\n"
+        "Кнопки:\n"
+        "🟢 Пришёл / 🔴 Ушёл — отметка смены (с привязкой геолокации)\n"
+        "🕒 Мои часы — сумма часов за период\n"
+        "📅 Мои смены — список смен\n"
+        "📍 Отправить геопозицию — сохранить локацию для ближайшей отметки"
+    )
+
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode=None)
+
+
+# ==========================
+# Запуск aiogram 3
+# ==========================
+async def main():
+    init_db()
+    print("Boss Control bot started.")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+наты точки контроля у менеджера."

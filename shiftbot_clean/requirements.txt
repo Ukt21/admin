@@ -1,6 +1,7 @@
-aiogram==3.10.0
+aiogram==3.4.3
 aiosqlite==0.20.0
 APScheduler==3.10.4
 python-dotenv==1.0.1
 pytz==2024.1
 python-dateutil==2.9.0.post0
+
